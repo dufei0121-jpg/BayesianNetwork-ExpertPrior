@@ -23,65 +23,6 @@ def calculate_hamming_distance(dag1, dag2):
     return len(edges1.symmetric_difference(edges2))
 
 
-def calculate_kl_divergence(dag1, dag2, data):
-    """
-    计算两个贝叶斯网络之间的KL散度
-    这里使用简化版本，基于边的存在概率
-    """
-    # 获取所有可能的边组合
-    nodes = list(set(dag1.nodes).union(set(dag2.nodes)))
-    all_possible_edges = set((u, v) for u in nodes for v in nodes if u != v)
-    
-    kl_divergence = 0
-    
-    # 计算每个可能的边在两个网络中的存在情况
-    for edge in all_possible_edges:
-        # 边存在的概率（这里简化为0或1）
-        p = 1 if edge in dag1.edges else 0
-        q = 1 if edge in dag2.edges else 0
-        
-        # KL散度计算：p * log(p/q)，需要避免log(0)的情况
-        if p > 0 and q > 0:
-            kl_divergence += p * math.log(p / q)
-        elif p > 0 and q == 0:
-            # 当p>0且q=0时，KL散度为无穷大，这里用一个大值代替
-            kl_divergence += 100
-    
-    return kl_divergence
-
-
-def calculate_correct_edge_ratio(learned_dag, standard_dag):
-    """
-    计算正确边比率
-    
-    Args:
-        learned_dag: 学习得到的DAG
-        standard_dag: 标准DAG
-        
-    Returns:
-        float: 正确边比率（0-1之间）
-    """
-    learned_edges = set(learned_dag.edges)
-    standard_edges = set(standard_dag.edges)
-    
-    # 正确识别的边（两个网络都有的边）
-    correct_edges = learned_edges.intersection(standard_edges)
-    
-    # 错误识别的边（学习网络有但标准网络没有的边）
-    false_edges = learned_edges - standard_edges
-    
-    # 遗漏的边（标准网络有但学习网络没有的边）
-    missed_edges = standard_edges - learned_edges
-    
-    # 正确边比率（基于标准网络）
-    if len(standard_edges) > 0:
-        correct_ratio = len(correct_edges) / len(standard_edges)
-    else:
-        correct_ratio = 0.0
-    
-    return correct_ratio
-
-
 def calculate_bic_score(dag, data):
     """
     计算贝叶斯网络的BIC评分
@@ -156,12 +97,12 @@ if __name__ == '__main__':
          'sample_fraction': 1,  # 样本比例 (0.1-1.0)
          'k_value': 0,  # 专家知识权重
          'random_state': 42,  # 随机种子
-         'standard_network_path': r"E:\BNSL\Bayesian_network_learning-master\LearningWithExpertKnowledge\data\标准网络.csv"  # 标准网络文件路径，None表示不进行比较
+         'standard_network_path': r"Bayesian_network_learning-master\LearningWithExpertKnowledge\data\standard_network.csv"  # 标准网络文件路径，None表示不进行比较
      }
      
      # 加载数据
-     asian_data = pd.read_csv(r"E:\BNSL\Bayesian_network_learning-master\LearningWithExpertKnowledge\data\asian.csv", index_col=0)     
-     expert_data = pd.read_csv(r"E:\BNSL\Bayesian_network_learning-master\LearningWithExpertKnowledge\data\asian_expert.csv", index_col=0)     
+     asian_data = pd.read_csv(r"Bayesian_network_learning-master\LearningWithExpertKnowledge\data\asian.csv", index_col=0)     
+     expert_data = pd.read_csv(r"Bayesian_network_learning-master\LearningWithExpertKnowledge\data\asian_expert.csv", index_col=0)     
      
      # 根据比例采样数据
      if config['sample_fraction'] < 1.0:
@@ -196,9 +137,8 @@ if __name__ == '__main__':
          try:
              standard_dag = load_standard_network(config['standard_network_path'])
              hamming_dist = calculate_hamming_distance(est.DAG, standard_dag)
-             kl_div = calculate_kl_divergence(est.DAG, standard_dag, sampled_data)
              print(f"\n与标准网络的汉明距离：{hamming_dist}")
-             print(f"与标准网络的KL散度：{kl_div:.4f}")
+      
          except Exception as e:
              print(f"\n无法加载标准网络或计算距离：{e}")
      else:
