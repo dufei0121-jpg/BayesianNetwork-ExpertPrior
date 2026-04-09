@@ -1,0 +1,414 @@
+import logging
+from collections import deque
+from itertools import permutations
+
+import pandas as pd  # 添加缺失的pandas导入
+import networkx as nx
+import numpy as np
+from tqdm import trange
+
+from LearningWithExpertKnowledge.expert import *
+from LearningWithExpertKnowledge.graph import DAG
+
+
+class Estimator:
+    def __init__(self, data: pd.DataFrame, expert: ExpertKnowledge, k=10000):
+        self.data = data
+        self.expert = expert
+        self.k = k
+        self.DAG = DAG()
+        self.vars = data.columns
+        self.state_names = {
+            var: self._collect_state_names(var) for var in self.vars
+        }
+        # 检查data的columns与expert的columns是否符合
+        for var in self.vars:
+            if var in data.columns:
+                continue
+            else:
+                raise ValueError("专家信息与data不符！")
+        # log 文件设置
+        logging.basicConfig(filename='log.txt', level=0, filemode="w", format="")
+        logging.info("*****日志文件*****")
+        logging.info("数据预览：")
+        logging.info(self.data.head(5))
+        logging.info("专家知识预览：")
+        logging.info(self.expert.data)
+
+    def _collect_state_names(self, variable):
+        """
+        收集该变量的状态名
+        :param variable:
+        :return:
+        """
+        states = sorted(list(self.data.loc[:, variable].dropna().unique()))
+        return states
+
+    def state_counts(self, variable, parents=None):
+        """
+
+        :param variable:
+        :param parents:
+        :return:
+        """
+        if parents is None:
+            parents = []
+        # 确保parents列表中没有重复元素，避免unstack时出现重复列名
+        parents = list(set(parents))
+
+        # ignores either any row containing NaN, or only those where the variable or its parents is NaN
+        data = self.data
+
+        if not parents:
+            # count how often each state of 'variable' occurred
+            state_count_data = data.loc[:, variable].value_counts()
+            state_counts = (
+                state_count_data.reindex(self.state_names[variable]).fillna(0).to_frame()
+            )
+
+        else:
+            parents_states = [self.state_names[parent] for parent in parents]
+            # count how often each state of 'variable' occurred, conditional on parents' states
+            state_count_data = (
+                data.groupby([variable] + parents).size().unstack(parents)
+            )
+            if not isinstance(state_count_data.columns, pd.MultiIndex):
+                state_count_data.columns = pd.MultiIndex.from_arrays(
+                    [state_count_data.columns]
+                )
+
+            # reindex rows & columns to sort them and to add missing ones
+            # missing row    = some state of 'variable' did not occur in data
+            # missing column = some state configuration of current 'variable's parents
+            #                  did not occur in data
+            row_index = self.state_names[variable]
+            column_index = pd.MultiIndex.from_product(parents_states, names=parents)
+            state_counts = state_count_data.reindex(
+                index=row_index, columns=column_index
+            ).fillna(0)
+
+        return state_counts
+
+    def expert_score(self, variable, parents):
+        """
+        专家评分部分
+        :param variable:
+        :param parents:
+        :return:
+        """
+        parents = set(parents)
+        sample_size = len(self.data)
+# 专家分数计算
+        score = 0
+       
+        for node in self.vars:
+            thinks = self.expert.think(variable, node)
+            if node == variable:
+                continue
+            elif node in parents:
+                # 对于已存在的父节点关系，根据专家评分计算贡献
+                score += abs(thinks[1] - 0.5) * (thinks[1] - 0.5)
+            else:
+                # 对于不存在的父节点关系，根据专家评分计算贡献
+                score += abs((1 - thinks[1]) - 0.5) * ((1 - thinks[1]) - 0.5)
+        # 考虑样本影响：
+        #score = iscore
+        score *= self.k * np.log(sample_size)
+        return score
+
+    def score_function(self, variable, parents):
+        """
+        使用BIC评分计算变量及其父节点的评分
+        
+        :param variable: 目标变量
+        :param parents: 父节点列表
+        :return: BIC评分 + 专家评分
+        """
+        var_states = self.state_names[variable]
+        var_cardinality = len(var_states)
+        state_counts = self.state_counts(variable, parents)
+        #sample_size = len(self.data)
+        effective_sample_size = state_counts.sum().sum()
+        if effective_sample_size <= 0:
+            return -1e12
+        sample_size = effective_sample_size
+        num_parents_states = float(state_counts.shape[1])
+
+        # 计算对数似然值
+        counts = np.asarray(state_counts)
+        log_likelihoods = np.zeros_like(counts, dtype=np.float64)
+
+        # 计算log-counts
+        np.log(counts, out=log_likelihoods, where=counts > 0)
+
+        # 计算log-conditional sample size
+        log_conditionals = np.sum(counts, axis=0, dtype=np.float64)
+        np.log(log_conditionals, out=log_conditionals, where=log_conditionals > 0)
+        # 计算log-likelihoods
+        log_likelihoods -= log_conditionals
+        log_likelihoods *= counts
+
+        log_likelihood = np.sum(log_likelihoods)
+        
+        # 计算BIC评分：BIC = log_likelihood - (d * log(n)) / 2
+        # d是模型参数数量：(节点状态数 - 1) * 父节点状态组合数
+        parent_cardinality = 1
+        for parent in parents:
+            parent_cardinality *= len(self.state_names[parent])
+        num_parameters = (var_cardinality - 1) * parent_cardinality
+        
+        bic_score = log_likelihood - (num_parameters * np.log(sample_size)) / 2
+
+        # 计算专家评分
+        expert_score = self.expert_score(variable=variable, parents=parents)
+        
+        # 最终评分 = BIC评分 + 专家评分
+        score = bic_score + expert_score
+        # 使用默认格式，让Python自动根据数值大小选择合适的表示方式（包括科学计数法）
+        logging.info("{}与{}组成的部分结构，BIC评分：{}，专家评分：{}，总评分：{}".format(
+            variable, parents, bic_score, expert_score, score))
+
+        return score
+
+    def legal_operations(self, tabu_list):
+        tabu_list = set(tabu_list)
+        potential_new_edges = (
+                set(permutations(self.vars, 2))
+                - set(self.DAG.edges())
+                - set([(Y, X) for (X, Y) in self.DAG.edges()])
+        )
+        for (X, Y) in potential_new_edges:
+            # Check if adding (X, Y) will create a cycle.
+            if not nx.has_path(self.DAG, Y, X):
+                operation = ("+", (X, Y))
+                if operation not in tabu_list:
+                    old_parents = self.DAG.get_parents(Y)
+                    new_parents = old_parents + [X]
+                    score_delta = self.score_function(Y, new_parents) - self.score_function(Y, old_parents)
+                    yield (operation, score_delta)
+
+        for (X, Y) in self.DAG.edges():
+            operation = ("-", (X, Y))
+            if operation not in tabu_list:
+                old_parents = self.DAG.get_parents(Y)
+                new_parents = old_parents[:]
+                new_parents.remove(X)
+                score_delta = self.score_function(Y, new_parents) - self.score_function(Y, old_parents)
+                yield (operation, score_delta)
+
+        for (X, Y) in self.DAG.edges():
+            # Check if flipping creates any cycles
+            if not any(
+                    map(lambda path: len(path) > 2, nx.all_simple_paths(self.DAG, X, Y))
+            ):
+                operation = ("flip", (X, Y))
+                if operation not in tabu_list:
+                    old_X_parents = self.DAG.get_parents(X)
+                    old_Y_parents = self.DAG.get_parents(Y)
+                    new_X_parents = old_X_parents + [Y]
+                    new_Y_parents = old_Y_parents[:]
+                    new_Y_parents.remove(X)
+                    score_delta = (
+                            self.score_function(X, new_X_parents)
+                            + self.score_function(Y, new_Y_parents)
+                            - self.score_function(X, old_X_parents)
+                            - self.score_function(Y, old_Y_parents)
+                    )
+                    yield (operation, score_delta)
+
+    def informedsearch(self,variable):
+        # 预搜索：通过设置随机数，当专家先验分数大于随机数时，给这条边先置边
+        for node in self.vars:
+            if node == variable:
+                continue
+            # 获取专家对node->variable的评分
+            thinks = self.expert.think(variable, node)
+            # 生成0-1之间的随机数
+            rand_num = np.random.rand()
+            # 当专家评分大于随机数时，添加边
+            if thinks[1] > rand_num:
+                self.DAG.add_edge(variable, node)
+        return self.DAG 
+    
+    def pre_remove_cycles(self):
+        """
+        预去环流程：基于拓扑排序思想去除图中的环路
+        1. 首先去除自循环
+        2. 不断找出父节点数最少的节点，若其父节点数不为零，则移除所有父边
+        3. 将该节点标记为已处理，重复直到所有节点都处理完毕
+        """
+        # 创建当前DAG的副本用于操作
+        current_dag = self.DAG.copy()
+        
+        # 1. 去除自循环
+        self_loops = [(node, node) for node in current_dag.nodes if (node, node) in current_dag.edges]
+        for loop in self_loops:
+            current_dag.remove_edge(*loop)
+        
+        # 2. 初始化已处理节点集合
+        processed_nodes = set()
+        all_nodes = set(current_dag.nodes)
+        
+        # 3. 循环处理直到所有节点都被处理
+        while processed_nodes != all_nodes:
+            # 找出未处理的节点
+            unprocessed_nodes = all_nodes - processed_nodes
+            
+            # 计算每个未处理节点的父节点数（仅考虑未处理的父节点）
+            node_parent_counts = {}
+            for node in unprocessed_nodes:
+                parents = current_dag.get_parents(node)
+                # 只计算未处理的父节点数量
+                unprocessed_parents = [p for p in parents if p in unprocessed_nodes]
+                node_parent_counts[node] = len(unprocessed_parents)
+            
+            # 找出父节点数最少的节点
+            min_parent_node = min(node_parent_counts, key=node_parent_counts.get)
+            min_parent_count = node_parent_counts[min_parent_node]
+            
+            # 如果该节点有未处理的父节点，则移除所有到该节点的边（来自未处理节点）
+            if min_parent_count > 0:
+                parents_to_remove = [p for p in current_dag.get_parents(min_parent_node) if p in unprocessed_nodes]
+                for parent in parents_to_remove:
+                    current_dag.remove_edge(parent, min_parent_node)
+            
+            # 将该节点标记为已处理
+            processed_nodes.add(min_parent_node)
+        
+        # 4. 更新原DAG
+        self.DAG = current_dag
+        return self.DAG
+     
+        
+    def run(self, epsilon=1e-4, max_iter=1e6):
+        """
+
+        :param epsilon:
+        :param max_iter:
+        :return:
+        """
+        ########
+        # 初始检查：略去
+        ########
+        # 初始化
+        start_dag = self.DAG
+        start_dag.add_nodes_from(self.vars)
+        '''
+        print("执行预搜索...")
+        for variable in self.vars:
+            start_dag = self.informedsearch(variable)
+        print(f"完成变量 {variable} 的预搜索")
+        
+        # 执行预去环操作
+        print("执行预去环操作...")
+        start_dag = self.pre_remove_cycles()
+        print("预去环操作完成")
+        '''
+        tabu_list = deque(maxlen=100)
+        current_model = start_dag
+        # 每次迭代，找到最佳的 (operation, score_delta)
+        iteration = trange(int(max_iter))
+        for _ in iteration:
+            logging.debug(current_model.edges)
+            # 获取所有合法操作
+            operations = list(self.legal_operations(tabu_list))
+            if not operations:
+                break
+                
+            # 选择分数变化最大的操作
+            best_operation, best_score_delta = max(operations, key=lambda t: t[1])
+            # 使用默认格式，让Python自动根据数值大小选择合适的表示方式（包括科学计数法）
+            logging.info("搜索到的最佳操作为：{}，分数变化：{}".format(best_operation, best_score_delta))
+            
+            # 只有当分数变化为正时才执行操作
+            if best_score_delta <= epsilon:
+                break
+            elif best_operation[0] == "+":
+                current_model.add_edge(*best_operation[1])
+                tabu_list.append(("-", best_operation[1]))
+            elif best_operation[0] == "-":
+                current_model.remove_edge(*best_operation[1])
+                tabu_list.append(("+", best_operation[1]))
+            elif best_operation[0] == "flip":
+                X, Y = best_operation[1]
+                current_model.remove_edge(X, Y)
+                current_model.add_edge(Y, X)
+                tabu_list.append(best_operation)
+        return current_model
+
+    def mic_of_edge(self, u, v):
+        """
+        计算一对边之间的相关性，MIC
+        参考文献：Detecting novel associations in large data sets[J]. science, 2011, 334(6062): 1518-1524.
+        :param u:
+        :param v:
+        :return:
+        """
+        pass
+
+    def corr_of_edges(self, u, v):
+        """
+        计算两个节点之间的相关系数
+        ps:相关系数衡量随机变量X与Y相关程度的一种方法，相关系数的取值范围是[-1,1]。
+        相关系数的绝对值越大，则表明X与Y相关度越高。 当X与Y线性相关时，相关系数取值为1（正线性相关）或-1（负线性相关）
+        :param u:
+        :param v:
+        :return:
+        """
+        var1 = self.data[u].values
+        var2 = self.data[v].values
+        corr = np.corrcoef(var1, var2)[0][1]
+        return corr
+
+    def add_weight_to_edges(self):
+        """
+        给每条边，根据corr增加权重,经过变换：
+        100：最远，相关性最弱
+        0：最近，相关性最强
+        :return:
+        """
+        if self.DAG.edges is None:
+            print("No edge was found!")
+            return None
+        for edge in self.DAG.edges:
+            weight = (1 - abs(self.corr_of_edges(edge[0], edge[1]))) * 100
+            self.DAG[edge[0]][edge[1]]["weight"] = weight
+
+    def importance_of_node(self, node):
+        """
+        计算该节点的重要度
+        参考文献：复杂网络中节点重要度评估的节点收缩方法[D]. , 2006.
+        :param node:
+        :return:
+        """
+        # 计算距离矩阵
+        distance_matrix = nx.floyd_warshall_numpy(self.DAG, weight="weight")
+        # 计算初始网络的凝聚度
+        where_are_inf = np.isinf(distance_matrix)
+        _distance_matrix = distance_matrix
+        _distance_matrix[where_are_inf] = 0
+        cohesion_of_initial_network = (len(self.DAG.nodes) - 1) / _distance_matrix.sum()
+        # 对node进行节点收缩
+        # 当对node进行节点收缩时，相当于把node的所有相邻节点到node的距离变为0
+
+    def centrality_of_nodes(self):
+        centrality = nx.katz_centrality(self.DAG, weight="weight")
+        return centrality
+
+
+if __name__ == '__main__':
+    chen_data = pd.DataFrame({
+        "A": [0, 0.8, 0, 0.3],
+        "B": [0.1, 0, 0.3, 0.9],
+        "C": [1, 0.2, 0, 0.1],
+        "D": [0.3, 0.2, 0.1, 0]
+    }, index=["A", "B", "C", "D"])
+    print(chen_data)
+    chen = ExpertKnowledge(data=chen_data)
+    data = pd.read_excel(r"./data/data.xlsx")
+    a = Estimator(data=data, expert=chen)
+    a.run()
+    print(a.corr_of_edges('A', 'B'))
+    a.add_weight_to_edges()
+    print(a.DAG.edges.data())
+    print(a.centrality_of_nodes())

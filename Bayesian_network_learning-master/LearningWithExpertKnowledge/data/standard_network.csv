@@ -1,0 +1,9 @@
+source,target
+smoke,lung
+smoke,bronc
+bronc,dysp
+lung,either
+asia,tub
+tub,either
+either,dysp
+either,xray
